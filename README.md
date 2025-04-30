@@ -1,5 +1,23 @@
 # AI Agent for Sepsis EHR Analysis 
 
+## Execution
+
+* Install packages: 
+```
+pip install -r requirements.txt
+```
+
+
+* Ensure you have an `OPENAI_API_KEY` in `.env` file 
+
+* Run the app: 
+
+```
+python start_app.py 
+```
+
+
+
 ## Project Notes
 
 * Develop individual tools first (e.g., retrieve info of a patient from user's query, collect simple stats, missing values imputation, train model to do mortality prediction, etc.) -> they'll need to work together later on when called by the agent
