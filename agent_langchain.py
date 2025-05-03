@@ -528,7 +528,7 @@ class SepsisAgent:
                     else:
                         risk_level = "very high"
                     
-                    return f"The patient {patient_id} has a {risk_level} risk of 90-day mortality with a probability of {mortality_prob:.1%}. Confidence: {confidence:.1%}."
+                    return f"The patient {patient_id} has a {risk_level} risk of 90-day mortality with a probability of {mortality_prob:.1%}."
             
             # If no patient ID specified, return model information
             else:
