@@ -827,4 +827,4 @@ async def get_html_report(patient_id: int):
 
 # Run app if main
 if __name__ == "__main__":
-    uvicorn.run("agent_langchain:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("agent_langchain:app", host="0.0.0.0", port=8000) # reload=True

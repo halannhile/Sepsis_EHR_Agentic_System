@@ -3,6 +3,8 @@ import numpy as np
 from typing import Dict, Any, Optional
 import json
 from sklearn.impute import SimpleImputer, KNNImputer
+# from sklearn.impute import IterativeImputer
+from sklearn.experimental import enable_iterative_imputer  
 from sklearn.impute import IterativeImputer
 from sklearn.ensemble import RandomForestRegressor
 import warnings
