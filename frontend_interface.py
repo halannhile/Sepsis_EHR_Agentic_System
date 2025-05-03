@@ -451,10 +451,53 @@ index_html = """
         
         // Function to send a quick command
         function sendQuickCommand(command) {
-            userInput.value = command;
-            sendMessage();
+            // For dataset summary specifically, we need to bypass the current patient ID
+            if (command === "Give me a summary of the dataset" || command === "Dataset Summary") {
+                // Create a direct request to get dataset summary without patient ID
+                fetch('/api/process_instruction', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    // Important: Do NOT include patient_id here
+                    body: JSON.stringify({
+                        instruction: "Give me a summary of the entire dataset"
+                    })
+                })
+                .then(response => response.json())
+                .then(data => {
+                    // Handle response as usual
+                    if (data.error) {
+                        addMessage('agent', `Error: ${data.error}`);
+                        return;
+                    }
+                    
+                    // Add agent message
+                    addMessage('agent', data.message);
+                    
+                    // Handle report if present
+                    if (data.report_html || data.report) {
+                        reportTitle.textContent = 'Dataset Report';
+                        reportContent.innerHTML = data.report_html || data.report;
+                        reportContainer.style.display = 'block';
+                    }
+                })
+                .catch(error => {
+                    addMessage('agent', `Error: ${error.message}`);
+                });
+                
+                // Add user message to chat
+                addMessage('user', "Give me a summary of the dataset");
+                
+                // Clear input
+                userInput.value = '';
+            } else {
+                // For all other commands, use the regular flow
+                userInput.value = command;
+                sendMessage();
+            }
         }
-        
+                
         // Function to add a message to the chat
         function addMessage(sender, content) {
             const messageDiv = document.createElement('div');
