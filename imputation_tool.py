@@ -3,8 +3,7 @@ import numpy as np
 from typing import Dict, Any, Optional
 import json
 from sklearn.impute import SimpleImputer, KNNImputer
-# from sklearn.impute import IterativeImputer
-from sklearn.experimental import enable_iterative_imputer  
+from sklearn.experimental import enable_iterative_imputer
 from sklearn.impute import IterativeImputer
 from sklearn.ensemble import RandomForestRegressor
 import warnings
@@ -25,6 +24,8 @@ class ImputationTool:
         """
         # Load training data
         self.train_df = pd.read_csv(train_data_path)
+        # Replace all 0 values with NaN in the training data
+        self.train_df.replace(0, np.nan, inplace=True)
         # Remove the index column if it exists (first unnamed column)
         if self.train_df.columns[0] == 'Unnamed: 0':
             self.train_df = self.train_df.drop(columns=self.train_df.columns[0])
@@ -94,7 +95,7 @@ class ImputationTool:
             elif col in valid_zero_vars:
                 # For these variables, zero is a valid value
                 zero_as_missing[col] = False
-            elif zero_pct > 0.5:
+            elif zero_pct > 0.01:
                 # If more than 50% of non-null values are zero, they're likely valid
                 zero_as_missing[col] = False
             elif values[values > 0].min() > 10 * values[values > 0].std():
@@ -103,6 +104,8 @@ class ImputationTool:
             else:
                 # Default: treat zeros as valid values
                 zero_as_missing[col] = False
+            
+            zero_as_missing[col] = True
         
         return zero_as_missing
     
@@ -259,7 +262,7 @@ class ImputationTool:
         
         elif method == 'mice':
             # Fit a MICE imputer (Multiple Imputation by Chained Equations)
-            imputer = IterativeImputer(estimator=RandomForestRegressor(n_estimators=10), 
+            imputer = IterativeImputer(estimator=RandomForestRegressor(n_estimators=5), 
                                       random_state=42, 
                                       max_iter=10)
             imputer.fit(processed_df[imputable_cols])
@@ -457,7 +460,7 @@ class ImputationTool:
         """
         if patient_id is not None:
             # Generate report for a specific patient
-            imputation_data = self.impute_patient_data(patient_id, method='mice')
+            imputation_data = self.impute_patient_data(patient_id, method='mean')
             
             if "error" in imputation_data:
                 return imputation_data["error"]
@@ -608,12 +611,12 @@ if __name__ == "__main__":
     imputation_tool = ImputationTool(train_data_path, test_data_path)
     
     # Detect missing values
-    missing_info = imputation_tool.detect_missing_values(imputation_tool.train_df)
-    print("Missing value statistics:")
-    print(json.dumps(missing_info, indent=2, default=str)[:1000] + "...")  # Truncate for readability
+    # missing_info = imputation_tool.detect_missing_values(imputation_tool.train_df)
+    # print("Missing value statistics:")
+    # print(json.dumps(missing_info, indent=2, default=str)[:1000] + "...")  # Truncate for readability
     
     # Fit imputation models
-    imputation_tool.fit_imputation_models(method='mice')
+    imputation_tool.fit_imputation_models(method='mean')
     
     # Get all patient IDs
     if 'icustayid' in imputation_tool.train_df.columns:
@@ -622,7 +625,7 @@ if __name__ == "__main__":
         if patient_ids:
             # Impute data for the first patient
             first_patient_id = patient_ids[0]
-            imputation_results = imputation_tool.impute_patient_data(first_patient_id, method='mice')
+            imputation_results = imputation_tool.impute_patient_data(first_patient_id, method='mean')
             print(f"\nImputation results for patient {first_patient_id}:")
             print(json.dumps(imputation_results, indent=2, default=str)[:1000] + "...")  # Truncate for readability
             
