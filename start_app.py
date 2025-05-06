@@ -8,8 +8,8 @@ import argparse
 # Configure the paths
 BACKEND_SCRIPT = "agent_langchain.py"
 FRONTEND_SCRIPT = "frontend_interface.py"
-BACKEND_PORT = 8000
-FRONTEND_PORT = 5001
+BACKEND_PORT = 8008
+FRONTEND_PORT = 5005
 
 # Global process handles
 backend_process = None

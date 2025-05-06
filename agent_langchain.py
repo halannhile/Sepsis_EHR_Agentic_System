@@ -14,7 +14,7 @@ import time
 from enum import Enum
 
 # Import Langchain components
-from langchain.agents import Tool, AgentOutputParser
+from langchain.agents import Tool, AgentOutputParser, LLMSingleActionAgent, AgentExecutor
 from langchain.prompts import StringPromptTemplate
 from langchain.schema import AgentAction, AgentFinish
 
@@ -190,7 +190,7 @@ class SepsisAgent:
         self._setup_langchain_agent()
         
         print("Agent initialization complete.")
-    
+        
     def _setup_langchain_agent(self):
         """Set up the LangChain agent with tools and LLM."""
         print("Setting up LangChain agent...")
@@ -248,11 +248,131 @@ class SepsisAgent:
                 )
             )
         
-        # Skip trying to use OpenAI entirely and use rule-based agent instead
-        print("Using rule-based agent to avoid OpenAI dependency issues.")
+        # Check if OpenAI API key is available
+        if OPENAI_API_KEY:
+            try:
+                # Try newer LangChain version first
+                try:
+                    from langchain_openai import ChatOpenAI
+                    from langchain.agents import AgentType, initialize_agent
+                    from langchain.prompts import PromptTemplate
+                    
+                    # Define a custom prompt that instructs the agent to output tool results directly
+                    custom_prefix = """You are an AI assistant for Sepsis EHR Analysis. Your job is to decide which tool to use based on the user's question.
+                    
+                    IMPORTANT: You must ONLY decide which tool to use. DO NOT summarize or rephrase the tool's output.
+                    Simply execute the appropriate tool and return its exact output without modification.
+
+                    IMPORTANT: when you are requested to provide a prediction, ONLY use the PredictionTool and return its results immediately. DO NOT call the ExplanationTool.                    
+                    You have access to the following tools:
+                    - DataSummaryTool: to generate a summary of the entire dataset 
+                    - PatientRetrievalTool: to generate a summary of a retrieved patient
+                    - ImputationTool: to impute missing values for a retrieved patient
+                    - PredictionTool: to predict the 90-day mortality risk for a retrieved patient
+                    - ExplanationTool: to generate explanations for the mortality prediction of the retrieved patient
+                    """
+                    
+                    custom_format_instructions = """Use the following format:
+                    
+                    Question: the input question you must answer
+                    Action: the action to take, should be one of [{tool_names}]
+                    Action Input: the input to the action
+                    Observation: the result of the action
+                    Final Answer: the original, unmodified output from the tool
+                    """
+                    
+                    # Initialize LLM
+                    llm = ChatOpenAI(
+                        api_key=OPENAI_API_KEY,
+                        temperature=0,
+                        model="gpt-3.5-turbo"
+                    )
+                    
+                    # Create agent with custom template
+                    agent_executor = initialize_agent(
+                        tools,
+                        llm,
+                        agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
+                        verbose=True,
+                        handle_parsing_errors=True,
+                        max_iterations=1,  # Limit to one tool call
+                        early_stopping_method="force",  # Force early stopping after one tool call
+                        prefix=custom_prefix,
+                        format_instructions=custom_format_instructions,
+                        return_intermediate_steps=True  # This will help with debugging
+                    )
+                    
+                    self.agent_executor = agent_executor
+                    print("LangChain agent with OpenAI setup complete.")
+                    return
+                    
+                except ImportError:
+                    # Try older LangChain version
+                    from langchain.chat_models import ChatOpenAI
+                    from langchain.agents import AgentType, initialize_agent
+                    
+                    # Define a custom prompt that instructs the agent to output tool results directly
+                    custom_prefix = """You are an AI assistant for Sepsis EHR Analysis. Your job is to decide which tool to use based on the user's question.
+                    
+                    IMPORTANT: You must ONLY decide which tool to use. DO NOT summarize or rephrase the tool's output.
+                    Simply execute the appropriate tool and return its exact output without modification.
+                    
+                    IMPORTANT: when you are requested to provide a prediction, ONLY use the PredictionTool and return its results immediately. DO NOT call the ExplanationTool.                    
+
+                    You have access to the following tools:
+                    - DataSummaryTool: to generate a summary of the entire dataset 
+                    - PatientRetrievalTool: to generate a summary of a retrieved patient
+                    - ImputationTool: to impute missing values for a retrieved patient
+                    - PredictionTool: to predict the 90-day mortality risk for a retrieved patient
+                    - ExplanationTool: to generate explanations for the mortality prediction of the retrieved patient
+                    """
+                    
+                    custom_format_instructions = """Use the following format:
+                    
+                    Question: the input question you must answer
+                    Action: the action to take, should be one of [{tool_names}]
+                    Action Input: the input to the action
+                    Observation: the result of the action
+                    Final Answer: the original, unmodified output from the tool
+                    """
+                    
+                    # Initialize LLM
+                    llm = ChatOpenAI(
+                        openai_api_key=OPENAI_API_KEY,
+                        temperature=0,
+                        model_name="gpt-3.5-turbo"
+                    )
+                    
+                    # Create agent with custom template
+                    agent_kwargs = {
+                        "prefix": custom_prefix,
+                        "format_instructions": custom_format_instructions,
+                        "handle_parsing_errors": True,
+                        "early_stopping_method": "force",  # Forces the agent to stop after one tool use if possible
+                    }
+
+                    agent_executor = initialize_agent(
+                        tools,
+                        llm,
+                        agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
+                        verbose=True,
+                        agent_kwargs=agent_kwargs,
+                        return_intermediate_steps=True
+                    )
+                    
+                    self.agent_executor = agent_executor
+                    print("LangChain agent with OpenAI setup complete (using older LangChain version).")
+                    return
+                    
+            except Exception as e:
+                print(f"Error setting up OpenAI agent: {str(e)}")
+                print("Falling back to rule-based agent.")
+        else:
+            print("OpenAI API key not available. Using rule-based agent.")
+        
+        # If we get here, use rule-based agent
         self.agent_executor = self._create_rule_based_agent(tools)
         print("Rule-based agent setup complete.")
-
 
     def _create_rule_based_agent(self, tools):
         """
@@ -365,15 +485,48 @@ class SepsisAgent:
     def _execute_patient_retrieval(self, input_str: str) -> str:
         """Execute patient retrieval tool based on input string."""
         try:
+            # Check for parameter-style input (patient_id=NUMBER)
+            param_match = re.search(r"patient_id=(\d+\.?\d*)", input_str)
+            if param_match:
+                patient_id = float(param_match.group(1))
+                
+                # Check if the patient exists
+                patient_ids = self.patient_retrieval_tool.get_patient_ids()
+                if patient_id not in patient_ids:
+                    return f"Patient ID {patient_id} not found in the dataset. Available patient IDs: {patient_ids[:20]}..."
+                
+                # Update current patient
+                self.current_patient_id = patient_id
+                
+                # Get patient summary
+                summary = self.patient_retrieval_tool.get_patient_summary(patient_id)
+                return summary
+                
+            # Check for simple patient ID first (pure number)
+            if input_str.strip().isdigit() or input_str.strip().replace('.', '', 1).isdigit():
+                patient_id = float(input_str.strip())
+                
+                # Check if the patient exists
+                patient_ids = self.patient_retrieval_tool.get_patient_ids()
+                if patient_id not in patient_ids:
+                    return f"Patient ID {patient_id} not found in the dataset. Available patient IDs: {patient_ids[:20]}..."
+                
+                # Update current patient
+                self.current_patient_id = patient_id
+                
+                # Get patient summary
+                summary = self.patient_retrieval_tool.get_patient_summary(patient_id)
+                return summary
+            
             # Parse input to extract parameters
-            patient_id_match = re.search(r"patient(?:_| )id:?\s*(\d+)", input_str)
+            patient_id_match = re.search(r"patient(?:_| )id:?\s*(\d+\.?\d*)", input_str)
             
             if not patient_id_match:
                 # Try another pattern
-                patient_id_match = re.search(r"patient (?:id |#)?(\d+)", input_str)
+                patient_id_match = re.search(r"patient (?:id |#)?(\d+\.?\d*)", input_str)
             
             if patient_id_match:
-                patient_id = int(patient_id_match.group(1))
+                patient_id = float(patient_id_match.group(1))
                 
                 # Update current patient
                 self.current_patient_id = patient_id
@@ -403,11 +556,17 @@ class SepsisAgent:
                     result = self.patient_retrieval_tool.get_patient_time_series(patient_id, variables)
                     return json.dumps(result, default=str)
             
+            # Check if summary is requested for the CURRENT patient (no ID specified)
+            elif ("summary" in input_str.lower() or "get patient" in input_str.lower()) and self.current_patient_id is not None:
+                patient_id = self.current_patient_id
+                summary = self.patient_retrieval_tool.get_patient_summary(patient_id)
+                return summary
+            
             # Check if similar patients are requested
             elif "similar" in input_str.lower():
-                ref_patient_match = re.search(r"reference(?:_| )patient(?:_| )id:?\s*(\d+)", input_str.lower())
+                ref_patient_match = re.search(r"reference(?:_| )patient(?:_| )id:?\s*(\d+\.?\d*)", input_str.lower())
                 if ref_patient_match:
-                    ref_patient_id = int(ref_patient_match.group(1))
+                    ref_patient_id = float(ref_patient_match.group(1))
                     n_match = re.search(r"n:?\s*(\d+)", input_str.lower())
                     n = int(n_match.group(1)) if n_match else 5
                     
@@ -417,7 +576,13 @@ class SepsisAgent:
             # If no specific parameters, return list of patient IDs
             else:
                 patient_ids = self.patient_retrieval_tool.get_patient_ids()
-                return f"Available patient IDs: {patient_ids[:20]}..."
+                
+                # If we have a current patient but no specific request, get summary
+                if self.current_patient_id is not None:
+                    summary = self.patient_retrieval_tool.get_patient_summary(self.current_patient_id)
+                    return summary
+                else:
+                    return f"Available patient IDs: {patient_ids[:20]}..."
         
         except Exception as e:
             return f"Error executing patient retrieval tool: {str(e)}"
@@ -425,115 +590,230 @@ class SepsisAgent:
     def _execute_imputation(self, input_str: str) -> str:
         """Execute imputation tool based on input string."""
         try:
-            # Parse input to extract parameters
+            # Parse input to extract patient ID
             patient_id_match = re.search(r"patient(?:_| )id:?\s*(\d+)", input_str)
             
             if not patient_id_match:
                 # Try another pattern
                 patient_id_match = re.search(r"patient (?:id |#)?(\d+)", input_str)
             
-            if patient_id_match:
+            # Also check if input is just a number
+            if not patient_id_match and input_str.strip().isdigit():
+                patient_id = int(input_str.strip())
+            elif patient_id_match:
                 patient_id = int(patient_id_match.group(1))
-                
-                # Determine imputation method
-                method = "mice"  # Default
-                if "mean" in input_str.lower():
-                    method = "mean"
-                elif "median" in input_str.lower():
-                    method = "median"
-                elif "knn" in input_str.lower():
-                    method = "knn"
-                
-                # Execute imputation
-                imputation_result = self.imputation_tool.impute_patient_data(patient_id, method)
-                
-                # Generate report
-                if "report" in input_str.lower() or "generate_report" in input_str.lower():
-                    report = self.imputation_tool.generate_imputation_report(patient_id)
-                    return report
-                
-                return json.dumps(imputation_result, default=str)
-            
-            # If no patient ID specified, generate general imputation report
             else:
-                report = self.imputation_tool.generate_imputation_report()
-                return report
+                return "Please provide a valid patient ID for imputation."
+            
+            # Update current patient
+            self.current_patient_id = patient_id
+            
+            # Determine imputation method
+            method = "mean"  # Use mean as default for faster processing
+            if "mice" in input_str.lower():
+                method = "mice"
+            elif "median" in input_str.lower():
+                method = "median"
+            elif "knn" in input_str.lower():
+                method = "knn"
+                
+            # Execute imputation
+            print(f"Starting imputation for patient {patient_id} using {method} method...")
+            imputation_result = self.imputation_tool.impute_patient_data(patient_id, method)
+            print(f"Imputation completed for patient {patient_id}")
+            
+            # Check if the imputation was completed successfully
+            if imputation_result.get("status") == "imputation_completed":
+                # Format the results into a readable report
+                report = []
+                report.append(f"# Imputation Report for Patient {patient_id}")
+                
+                # Add imputation method
+                report.append("## Imputation Method")
+                report.append(f"Method used: {method.upper()} {self._get_method_description(method)}")
+                
+                # Add missing variables section - each on its own line
+                missing_cols = imputation_result.get("missing_columns", {})
+                
+                report.append("## Missing Variables")
+                if missing_cols:
+                    for col, count in missing_cols.items():
+                        report.append(f"- {col}: {count} missing values")
+                else:
+                    report.append("No missing values were detected for this patient.")
+                
+                # Imputation details - show values after imputation
+                report.append("## Imputation Details")
+                
+                # Extract imputation results
+                imputation_results = imputation_result.get("imputation_results", [])
+                imputation_stats = imputation_result.get("imputation_stats", {})
+                
+                # Count total imputed values
+                total_imputed = 0
+                all_imputed_vars = set()
+                
+                for record in imputation_results:
+                    imputed_values = record.get("imputed", {})
+                    total_imputed += len(imputed_values)
+                    for var_name in imputed_values.keys():
+                        all_imputed_vars.add(var_name)
+                
+                # Organize imputed values by variable
+                variable_imputed_values = {}
+                for record_idx, record in enumerate(imputation_results):
+                    imputed_values = record.get("imputed", {})
+                    for var_name, value in imputed_values.items():
+                        if var_name not in variable_imputed_values:
+                            variable_imputed_values[var_name] = []
+                        
+                        # Get info about how it was calculated
+                        var_stats = imputation_stats.get(var_name, {})
+                        imp_method = var_stats.get("method", method)
+                        imp_value = var_stats.get("value")
+                        
+                        # Create description based on method
+                        if imp_method in ["mean", "median"] and imp_value is not None:
+                            method_desc = f"using {imp_method} value: {imp_value:.2f}"
+                        elif imp_method == "knn":
+                            method_desc = "using K-Nearest Neighbors"
+                        elif imp_method == "mice":
+                            method_desc = "using MICE"
+                        else:
+                            method_desc = f"using {imp_method}"
+                        
+                        variable_imputed_values[var_name].append({
+                            "record_idx": record_idx,
+                            "value": value,
+                            "method_desc": method_desc
+                        })
+                
+                # List all variables with their imputed values
+                if variable_imputed_values:
+                    report.append(f"Total imputed values: {total_imputed}")
+                    for var_name, values in sorted(variable_imputed_values.items()):
+                        report.append(f"### {var_name}")
+                        for value_info in values:
+                            report.append(f"- Record {value_info['record_idx']+1}: {value_info['value']:.2f} (imputed {value_info['method_desc']})")
+                else:
+                    report.append("No values were imputed.")
+                
+                return "\n".join(report)
+            
+            elif imputation_result.get("status") == "no_imputation_needed":
+                return f"No missing values to impute for patient {patient_id}."
+            else:
+                # If there was an error or unexpected result format
+                if "error" in imputation_result:
+                    return f"Error during imputation: {imputation_result['error']}"
+                else:
+                    return f"Imputation could not be completed. Result: {json.dumps(imputation_result, default=str)}"
         
         except Exception as e:
+            print(f"Detailed error in imputation: {str(e)}")
+            import traceback
+            traceback.print_exc()
             return f"Error executing imputation tool: {str(e)}"
+
+    def _get_method_description(self, method: str) -> str:
+        """Get a description of the imputation method."""
+        if method == "mean":
+            return "Mean imputation replaces missing values with the average value across all patients."
+        elif method == "median":
+            return "Median imputation replaces missing values with the median value across all patients."
+        elif method == "knn":
+            return "KNN imputation uses similar patients to predict missing values."
+        elif method == "mice":
+            return "MICE uses relationships between variables to predict missing values."
+        else:
+            return f"{method} imputation"
     
     def _execute_prediction(self, input_str: str) -> str:
         """Execute prediction tool based on input string."""
         try:
-            # Parse input to extract parameters
+            # Parse input to extract patient ID
             patient_id_match = re.search(r"patient(?:_| )id:?\s*(\d+)", input_str)
             
             if not patient_id_match:
                 # Try another pattern
                 patient_id_match = re.search(r"patient (?:id |#)?(\d+)", input_str)
             
-            if patient_id_match:
+            # Also check if input is just a number
+            if not patient_id_match and input_str.strip().isdigit():
+                patient_id = int(input_str.strip())
+            elif patient_id_match:
                 patient_id = int(patient_id_match.group(1))
+            else:
+                return "Please provide a valid patient ID for prediction."
+            
+            # Update current patient
+            self.current_patient_id = patient_id
+            
+            # Get patient data from PatientRetrievalTool
+            if self.patient_retrieval_tool:
+                # Check if patient exists in either dataset
+                patient_df = None
                 
-                # Update current patient
-                self.current_patient_id = patient_id
-                
-                # Get patient data from PatientRetrievalTool
-                if self.patient_retrieval_tool:
-                    # Check if patient exists in training data
-                    train_patient_exists = 'icustayid' in self.patient_retrieval_tool.train_df.columns and patient_id in self.patient_retrieval_tool.train_df['icustayid'].values
-                    
-                    # Check if patient exists in test data
-                    test_patient_exists = (self.patient_retrieval_tool.test_df is not None and 
-                                        'icustayid' in self.patient_retrieval_tool.test_df.columns and 
-                                        patient_id in self.patient_retrieval_tool.test_df['icustayid'].values)
-                    
-                    if not train_patient_exists and not test_patient_exists:
-                        return f"Patient ID {patient_id} not found in the dataset."
-                    
-                    # Get patient data
+                # Check training dataset
+                if 'icustayid' in self.patient_retrieval_tool.train_df.columns:
+                    train_patient_exists = patient_id in self.patient_retrieval_tool.train_df['icustayid'].values
                     if train_patient_exists:
-                        patient_df = self.patient_retrieval_tool.train_df[self.patient_retrieval_tool.train_df['icustayid'] == patient_id].copy()
-                    else:
-                        patient_df = self.patient_retrieval_tool.test_df[self.patient_retrieval_tool.test_df['icustayid'] == patient_id].copy()
-                    
-                    self.current_patient_data = patient_df
-                    
+                        patient_df = self.patient_retrieval_tool.train_df[
+                            self.patient_retrieval_tool.train_df['icustayid'] == patient_id
+                        ].copy()
+                
+                # Check test dataset if not found in training
+                if patient_df is None and self.patient_retrieval_tool.test_df is not None:
+                    if 'icustayid' in self.patient_retrieval_tool.test_df.columns:
+                        test_patient_exists = patient_id in self.patient_retrieval_tool.test_df['icustayid'].values
+                        if test_patient_exists:
+                            patient_df = self.patient_retrieval_tool.test_df[
+                                self.patient_retrieval_tool.test_df['icustayid'] == patient_id
+                            ].copy()
+                
+                if patient_df is None:
+                    return f"Patient ID {patient_id} not found in the dataset."
+                
+                self.current_patient_data = patient_df
+                
+                # IMPORTANT: Make actual prediction using the prediction tool
+                if self.prediction_tool and self.prediction_tool.model is not None:
                     # Make prediction
                     prediction = self.prediction_tool.predict_mortality(patient_df)
                     self.current_prediction = prediction
                     
-                    # Generate report
-                    if "report" in input_str.lower():
+                    # Extract key information
+                    mortality_prob = prediction["mortality_probability"]
+                    risk_level = prediction["risk_level"]
+                    confidence = prediction.get("confidence", 0.8)  # Default if not available
+                    
+                    # Generate report if requested
+                    if "report" in input_str.lower() or "detailed" in input_str.lower():
                         report = self.prediction_tool.generate_patient_report(patient_df)
                         return report
                     
-                    # Check if explanation is requested
-                    if "explain" in input_str.lower() and self.xai_tool is not None:
-                        explanation = self.xai_tool.generate_explanation(patient_df, prediction)
-                        self.current_explanation = explanation
-                        return json.dumps({"prediction": prediction, "explanation": explanation["summary"]}, default=str)
+                    # Format a clear response with the prediction results
+                    response = f"""# Mortality Prediction for Patient {patient_id}"""
+                    response += "\n## Summary"
+                    response += f"\n**Risk Level**: {risk_level}\n"             
+                    response += f"\n**90-day Mortality Risk**: {mortality_prob:.1%}\n"
+
+                    # # Add key contributing factors if available
+                    # if "contributing_features" in prediction and prediction["contributing_features"]:
+                    #     response += "\n## Key Contributing Factors\n"
+                    #     for i, feature in enumerate(prediction["contributing_features"][:3]):
+                    #         feature_name = feature["feature"].replace('_', ' ').title()
+                    #         value = feature["value"]
+                    #         response += f"{i+1}. {feature_name}: {value:.2f}\n"
                     
-                    # Format output
-                    mortality_prob = prediction["mortality_probability"]
-                    confidence = prediction["confidence"]
+                    # Add recommendation for detailed report
+                    response += "\nFor a detailed explanation, you can request a full report by asking for 'explain prediction for patient " + str(patient_id) + "'."
                     
-                    # Determine risk level
-                    if mortality_prob < 0.25:
-                        risk_level = "low"
-                    elif mortality_prob < 0.5:
-                        risk_level = "moderate"
-                    elif mortality_prob < 0.75:
-                        risk_level = "high"
-                    else:
-                        risk_level = "very high"
-                    
-                    return f"The patient {patient_id} has a {risk_level} risk of 90-day mortality with a probability of {mortality_prob:.1%}."
-            
-            # If no patient ID specified, return model information
+                    return response
+                else:
+                    return "Prediction model is not available. Please ensure the model has been trained or loaded correctly."
             else:
-                model_card = self.prediction_tool.get_model_card()
-                return model_card
+                return "Patient retrieval tool is not available. Cannot get patient data for prediction."
         
         except Exception as e:
             return f"Error executing prediction tool: {str(e)}"
@@ -541,104 +821,93 @@ class SepsisAgent:
     def _execute_explanation(self, input_str: str) -> str:
         """Execute XAI tool based on input string."""
         try:
-            # Parse input to extract parameters
-            patient_id_match = re.search(r"patient(?:_| )id:?\s*(\d+)", input_str)
-            
-            if not patient_id_match:
-                # Try another pattern
-                patient_id_match = re.search(r"patient (?:id |#)?(\d+)", input_str)
-            
-            if patient_id_match:
-                patient_id = int(patient_id_match.group(1))
+            # Try to directly parse the input as a patient ID if it's just a number
+            if input_str.strip().isdigit():
+                patient_id = int(input_str.strip())
                 
                 # Update current patient
                 self.current_patient_id = patient_id
-                
-                # Check if simplified explanation is requested
-                simplified_requested = "simple" in input_str.lower() or "simplified" in input_str.lower()
-                
-                # Check if plots should be skipped (to avoid timeout issues)
-                skip_plots = "no plots" in input_str.lower() or "text only" in input_str.lower()
-                
-                # Check if we already have a prediction for this patient
-                if self.current_patient_id == patient_id and self.current_prediction is not None and self.current_patient_data is not None:
-                    # Generate explanation
-                    explanation = self.xai_tool.generate_explanation(
-                        self.current_patient_data, 
-                        self.current_prediction,
-                        skip_shap_plots=skip_plots
-                    )
-                    self.current_explanation = explanation
-                    
-                    # Check if simplified explanation is requested
-                    if simplified_requested:
-                        simplified_explanation = self.xai_tool.generate_simplified_explanation(explanation)
-                        return simplified_explanation
-                    
-                    return explanation["summary"]
-                
-                # Otherwise, get patient data and make prediction first
-                else:
-                    # Get patient data from PatientRetrievalTool
-                    if self.patient_retrieval_tool:
-                        # Check if patient exists in training data
-                        train_patient_exists = 'icustayid' in self.patient_retrieval_tool.train_df.columns and patient_id in self.patient_retrieval_tool.train_df['icustayid'].values
-                        
-                        # Check if patient exists in test data
-                        test_patient_exists = (self.patient_retrieval_tool.test_df is not None and 
-                                            'icustayid' in self.patient_retrieval_tool.test_df.columns and 
-                                            patient_id in self.patient_retrieval_tool.test_df['icustayid'].values)
-                        
-                        if not train_patient_exists and not test_patient_exists:
-                            return f"Patient ID {patient_id} not found in the dataset."
-                        
-                        # Get patient data
-                        if train_patient_exists:
-                            patient_df = self.patient_retrieval_tool.train_df[self.patient_retrieval_tool.train_df['icustayid'] == patient_id].copy()
-                        else:
-                            patient_df = self.patient_retrieval_tool.test_df[self.patient_retrieval_tool.test_df['icustayid'] == patient_id].copy()
-                        
-                        self.current_patient_data = patient_df
-                        
-                        # Make prediction
-                        prediction = self.prediction_tool.predict_mortality(patient_df)
-                        self.current_prediction = prediction
-                        
-                        # Generate explanation
-                        explanation = self.xai_tool.generate_explanation(
-                            patient_df, 
-                            prediction,
-                            skip_shap_plots=skip_plots
-                        )
-                        self.current_explanation = explanation
-                        
-                        # Check if simplified explanation is requested
-                        if simplified_requested:
-                            simplified_explanation = self.xai_tool.generate_simplified_explanation(explanation)
-                            return simplified_explanation
-                        
-                        return explanation["summary"]
-            
-            # If no specific parameters, generate general explanation
             else:
-                if self.current_patient_id is not None and self.current_prediction is not None and self.current_patient_data is not None:
-                    # Generate explanation for current patient
-                    explanation = self.xai_tool.generate_explanation(
-                        self.current_patient_data, 
-                        self.current_prediction,
-                        skip_shap_plots=True  # Skip plots for general explanation
-                    )
-                    self.current_explanation = explanation
-                    return explanation["summary"]
+                # Original parsing logic for more complex queries
+                patient_id_match = re.search(r"patient(?:_| )id:?\s*(\d+)", input_str)
+                
+                if not patient_id_match:
+                    # Try another pattern
+                    patient_id_match = re.search(r"patient (?:id |#)?(\d+)", input_str)
+                
+                if patient_id_match:
+                    patient_id = int(patient_id_match.group(1))
+                    
+                    # Update current patient
+                    self.current_patient_id = patient_id
                 else:
-                    return "No patient is currently selected. Please specify a patient ID to generate an explanation."
+                    # If no patient ID specified, use current patient if available
+                    if self.current_patient_id is not None:
+                        patient_id = self.current_patient_id
+                    else:
+                        return "Please specify a patient ID to explain the prediction."
+            
+            # Check if simplified explanation is requested
+            simplified_requested = "simple" in input_str.lower() or "simplified" in input_str.lower()
+            
+            # Check if plots should be skipped (to avoid timeout issues)
+            skip_plots = "no plots" in input_str.lower() or "text only" in input_str.lower()
+            
+            # Get patient data and make prediction if not already done
+            if (self.current_patient_id != patient_id or 
+                self.current_prediction is None or 
+                self.current_patient_data is None):
+                
+                # Get patient data
+                patient_df = self._get_patient_data(patient_id)
+                
+                if patient_df is None:
+                    return f"Patient ID {patient_id} not found in the dataset."
+                
+                self.current_patient_data = patient_df
+                
+                # Make prediction
+                prediction = self.prediction_tool.predict_mortality(patient_df)
+                self.current_prediction = prediction
+            else:
+                # Use cached data and prediction
+                patient_df = self.current_patient_data
+                prediction = self.current_prediction
+            
+            # Generate explanation
+            explanation = self.xai_tool.generate_explanation(
+                patient_df, 
+                prediction,
+                skip_shap_plots=skip_plots
+            )
+            self.current_explanation = explanation
+            
+            # Use Explanation Agent to reason about the explanation
+            from explanation_agent import ExplanationAgent
+            explanation_agent = ExplanationAgent()
+            
+            # Add the prediction to the explanation data for better reasoning
+            explanation_data = explanation.copy()
+            explanation_data["prediction"] = prediction
+            
+            # Get the reasoned explanation
+            reasoned_explanation = explanation_agent.analyze_explanation(explanation_data)
+            
+            # Check if simplified explanation is requested
+            if simplified_requested:
+                simplified_explanation = self.xai_tool.generate_simplified_explanation(explanation)
+                return simplified_explanation
+            
+            return reasoned_explanation
         
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             return f"Error executing explanation tool: {str(e)}"
     
     def _get_patient_data(self, patient_id: int) -> Optional[pd.DataFrame]:
         """
-        Get data for a specific patient.
+        Get data for a specific patient from either training or test dataset.
         
         Args:
             patient_id: Patient ID
@@ -646,23 +915,30 @@ class SepsisAgent:
         Returns:
             DataFrame with patient data or None if not found
         """
-        # Make sure patient retrieval tool is available
+        # Check if patient retrieval tool is available
         if self.patient_retrieval_tool is None:
             return None
         
-        # Check if patient exists
-        if not self.patient_retrieval_tool.get_patient_ids() or patient_id not in self.patient_retrieval_tool.get_patient_ids():
+        # Check if patient exists in training data
+        train_patient_exists = ('icustayid' in self.patient_retrieval_tool.train_df.columns and 
+                            patient_id in self.patient_retrieval_tool.train_df['icustayid'].values)
+        
+        # Check if patient exists in test data
+        test_patient_exists = (self.patient_retrieval_tool.test_df is not None and 
+                            'icustayid' in self.patient_retrieval_tool.test_df.columns and 
+                            patient_id in self.patient_retrieval_tool.test_df['icustayid'].values)
+        
+        if not train_patient_exists and not test_patient_exists:
             return None
         
-        # Get patient data
-        patient_df = self.patient_retrieval_tool.train_df[self.patient_retrieval_tool.train_df['icustayid'] == patient_id].copy()
-        
-        # If not found in training data, try test data if available
-        if len(patient_df) == 0 and hasattr(self.patient_retrieval_tool, 'test_df') and self.patient_retrieval_tool.test_df is not None:
+        # Get patient data from the appropriate dataset
+        if train_patient_exists:
+            patient_df = self.patient_retrieval_tool.train_df[self.patient_retrieval_tool.train_df['icustayid'] == patient_id].copy()
+        else:
             patient_df = self.patient_retrieval_tool.test_df[self.patient_retrieval_tool.test_df['icustayid'] == patient_id].copy()
         
         return patient_df if len(patient_df) > 0 else None
-    
+        
     def process_instruction(self, instruction: str, patient_id: Optional[int] = None, context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Process a user instruction"""
         try:
@@ -677,20 +953,43 @@ class SepsisAgent:
             
             # Use the agent executor with robust error handling
             try:
-                # Direct execution without relying on run method
                 if hasattr(self.agent_executor, 'run'):
-                    result = self.agent_executor.run(input=instruction)
+                    # For LangChain agent
+                    if hasattr(self.agent_executor, 'return_intermediate_steps') and self.agent_executor.return_intermediate_steps:
+                        # For agents that return intermediate steps
+                        result_with_steps = self.agent_executor(instruction)
+                        
+                        # Extract the last observation from the intermediate steps
+                        if 'intermediate_steps' in result_with_steps:
+                            steps = result_with_steps['intermediate_steps']
+                            if steps:
+                                # Get the last observation (tool output)
+                                last_action, last_observation = steps[-1]
+                                result = last_observation
+                            else:
+                                result = result_with_steps.get('output', str(result_with_steps))
+                        else:
+                            result = result_with_steps.get('output', str(result_with_steps))
+                    else:
+                        # Standard run method for regular agents
+                        result = self.agent_executor.run(instruction)
                 else:
-                    # For our rule-based fallback agent
+                    # Direct execution for rule-based agents or other non-standard agents
                     result = self.agent_executor(instruction)
             except Exception as e:
                 print(f"Error executing agent: {str(e)}")
                 # Fallback to using the rule-based approach directly
-                if hasattr(self, '_create_rule_based_agent'):
-                    fallback_agent = self._create_rule_based_agent(self.agent_executor.tools if hasattr(self.agent_executor, 'tools') else [])
+                fallback_agent = self._create_rule_based_agent([])
+                rule_based_class = fallback_agent.__class__
+                
+                if not isinstance(self.agent_executor, rule_based_class):
+                    # If not already using rule-based agent, create a new one with the available tools
+                    tools = self.agent_executor.tools if hasattr(self.agent_executor, 'tools') else []
+                    fallback_agent = self._create_rule_based_agent(tools)
                     result = fallback_agent.run(input=instruction)
                 else:
-                    result = f"Error processing instruction: {str(e)}"
+                    # If already using rule-based agent, try direct execution with input parameter
+                    result = self.agent_executor.run(input=instruction)
             
             # Parse the result
             response = self._parse_agent_result(result, instruction)
@@ -714,33 +1013,17 @@ class SepsisAgent:
         Returns:
             Structured response dictionary
         """
+        # For prediction results, return them unchanged
+        if "Mortality Prediction for Patient" in result or "Risk Level" in result:
+            return {"message": result, "report": result}
+        
+        # Otherwise, use the normal parsing logic
         response = {"message": result}
         
         # Check if result contains a report or explanation
         if "##" in result or "#" in result:
             # Likely a markdown report
             response["report"] = result
-        
-        # Check if the result contains prediction information
-        if "risk of mortality" in result.lower():
-            # Extract probability if present
-            prob_match = re.search(r"probability of (\d+\.\d+%)", result)
-            if prob_match:
-                probability = float(prob_match.group(1).rstrip("%")) / 100
-                risk_level = "low"
-                if probability >= 0.25 and probability < 0.5:
-                    risk_level = "moderate"
-                elif probability >= 0.5 and probability < 0.75:
-                    risk_level = "high"
-                else:
-                    risk_level = "very high"
-                
-                response["data"] = {
-                    "prediction": {
-                        "mortality_probability": probability,
-                        "risk_level": risk_level
-                    }
-                }
         
         # Include current patient ID if available
         if self.current_patient_id is not None:
@@ -827,4 +1110,4 @@ async def get_html_report(patient_id: int):
 
 # Run app if main
 if __name__ == "__main__":
-    uvicorn.run("agent_langchain:app", host="0.0.0.0", port=8000) # reload=True
+    uvicorn.run("agent_langchain:app", host="0.0.0.0", port=8008, reload=True) # reload=True

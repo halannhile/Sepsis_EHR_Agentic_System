@@ -8,7 +8,7 @@ import markdown
 app = Flask(__name__)
 
 # Configuration
-API_URL = "http://localhost:8000"  # URL of the backend API
+API_URL = "http://localhost:8008"  # URL of the backend API
 
 @app.route('/')
 def index():
@@ -558,4 +558,4 @@ with open('templates/index.html', 'w') as f:
 
 # Run the Flask app
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5001)
+    app.run(debug=True, host='0.0.0.0', port=5005)

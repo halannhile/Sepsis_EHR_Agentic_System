@@ -1,300 +1,305 @@
 import pandas as pd
 import numpy as np
-from typing import Dict, Any, List, Union
+from typing import Dict, Any, List, Optional, Union
+import json
 import pickle
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
-from sklearn.linear_model import LogisticRegression
+import matplotlib.pyplot as plt
+import io
+import base64
+import catboost as cb
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import roc_auc_score, f1_score, precision_score, recall_score, accuracy_score
-from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.impute import SimpleImputer
-from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.metrics import f1_score, roc_auc_score, confusion_matrix, classification_report
+
 
 class PredictionTool:
     """
-    Tool for predicting 90-day mortality in sepsis patients.
+    Tool for predicting mortality risk in sepsis patients.
     """
     
-    def __init__(self, train_data_path: str, model_type: str = 'random_forest'):
+    def __init__(self, data_path: str):
         """
-        Initialize the tool with the path to the dataset and model type.
+        Initialize the tool with the path to the dataset.
         
         Args:
-            train_data_path: Path to the training CSV file
-            model_type: Type of model to use ('random_forest', 'gradient_boosting', or 'logistic_regression')
+            data_path: Path to the CSV file containing the dataset
         """
         # Load training data
-        self.train_df = pd.read_csv(train_data_path)
+        self.df = pd.read_csv(data_path)
+        
         # Remove the index column if it exists (first unnamed column)
-        if self.train_df.columns[0] == 'Unnamed: 0':
-            self.train_df = self.train_df.drop(columns=self.train_df.columns[0])
+        if self.df.columns[0] == 'Unnamed: 0':
+            self.df = self.df.drop(columns=self.df.columns[0])
         
-        # Check if mortality_90d is in the training data
-        if 'mortality_90d' not in self.train_df.columns:
-            raise ValueError("mortality_90d not found in training data")
-        
-        # Define columns that should not be used as features
-        self.non_features = ['bloc', 'icustayid', 'charttime', 'mortality_90d']
-        
-        # Store information about zero values that likely represent missing data
-        self.zero_as_missing = self._detect_zero_as_missing()
-        
-        # Initialize model
-        self.model_type = model_type
+        # Initialize model and other components
         self.model = None
+        self.feature_names = None
+        self.features_to_use = None
+        self.preprocessor = None
         self.feature_importance = {}
-        self.model_performance = {}
-        self.scaler = None
-        self.imputer = None
+        self.threshold = 0.5  # Default threshold for binary classification
+        
+        # Identify which features are non-imputable (e.g., IDs, timestamps, target)
+        self.non_imputable = ['bloc', 'icustayid', 'charttime', 'gender', 'mortality_90d']
+        
+        # Preprocess the data
+        self._preprocess_data()
     
-    def _detect_zero_as_missing(self) -> Dict[str, bool]:
+    def _preprocess_data(self):
         """
-        Detect which variables have zeros that likely represent missing values.
+        Preprocess the dataset for model training, defining features and target.
+        """
+        # Convert charttime to datetime if it exists
+        if 'charttime' in self.df.columns:
+            try:
+                self.df['charttime'] = pd.to_datetime(self.df['charttime'])
+                
+                # Extract useful datetime features if needed
+                # self.df['hour_of_day'] = self.df['charttime'].dt.hour
+                # self.df['day_of_week'] = self.df['charttime'].dt.dayofweek
+            except:
+                print("Could not convert charttime to datetime, will use as-is")
+        
+        # Convert age from days to years if exists
+        if 'age' in self.df.columns:
+            self.df['age'] = self.df['age'] / 365.25
+        
+        # Identify which features to use for prediction
+        # Excluding non-predictive features or IDs
+        self.features_to_use = [col for col in self.df.columns 
+                              if col not in self.non_imputable
+                              and pd.api.types.is_numeric_dtype(self.df[col])]
+        
+        # Store feature names for later use
+        self.feature_names = self.features_to_use
+        
+        print(f"Preprocessing complete. Using {len(self.features_to_use)} features for prediction.")
+    
+    def get_aggregated_patient_data(self) -> pd.DataFrame:
+        """
+        Aggregate the time series data to create one record per patient.
         
         Returns:
-            Dictionary mapping column names to boolean indicating if zeros should be treated as missing
+            DataFrame with one row per patient, aggregated features
         """
-        zero_as_missing = {}
+        # Skip if no time series (e.g., already one record per patient)
+        if 'icustayid' not in self.df.columns:
+            return self.df.copy()
         
-        # Skip non-numeric columns and columns that shouldn't be used as features
-        for col in self.train_df.columns:
-            if col in self.non_features or not pd.api.types.is_numeric_dtype(self.train_df[col]):
-                continue
-                
-            # Get non-null values
-            values = self.train_df[col].dropna()
-            
-            # Skip if no values or no zeros
-            if len(values) == 0 or (values == 0).sum() == 0:
-                zero_as_missing[col] = False
-                continue
-            
-            # Calculate statistics
-            zero_count = (values == 0).sum()
-            zero_pct = zero_count / len(values)
-            
-            # Variables where zero is likely to be a missing value indicator
-            likely_missing_vars = [
-                'Potassium', 'Sodium', 'Chloride', 'Albumin', 'Hb', 'WBC_count', 
-                'Platelets_count', 'paO2', 'paCO2', 'Arterial_pH', 'HCO3'
-            ]
-            
-            # Variables where zero is likely to be a valid measurement
-            valid_zero_vars = [
-                'mechvent', 'input_4hourly', 'output_4hourly', 'median_dose_vaso', 
-                'max_dose_vaso', 'Total_bili', 'SGOT', 'SGPT'
-            ]
-            
-            # Determine if zeros should be treated as missing
-            if col in likely_missing_vars:
-                # For these variables, physiologically impossible to be zero
-                zero_as_missing[col] = True
-            elif col in valid_zero_vars:
-                # For these variables, zero is a valid value
-                zero_as_missing[col] = False
-            elif zero_pct > 0.5:
-                # If more than 50% of non-null values are zero, they're likely valid
-                zero_as_missing[col] = False
-            elif values[values > 0].min() > 10 * values[values > 0].std():
-                # If the minimum non-zero value is much larger than the std, zeros likely represent missing values
-                zero_as_missing[col] = True
-            else:
-                # Default: treat zeros as valid values
-                zero_as_missing[col] = False
+        # Group by patient ID and calculate aggregations
+        agg_dict = {}
         
-        return zero_as_missing
+        # For each numeric feature, calculate various statistics
+        for feature in self.features_to_use:
+            agg_dict[feature] = ['mean', 'min', 'max', 'std', 'last']
+        
+        # For the target variable if it exists
+        if 'mortality_90d' in self.df.columns:
+            agg_dict['mortality_90d'] = 'first'  # Each patient has one mortality outcome
+        
+        # For non-numeric features we want to keep
+        for feature in ['gender']:
+            if feature in self.df.columns:
+                agg_dict[feature] = 'first'
+        
+        # Perform the aggregation
+        patient_df = self.df.groupby('icustayid').agg(agg_dict)
+        
+        # Flatten the column names
+        patient_df.columns = ['_'.join(col).strip() for col in patient_df.columns.values]
+        
+        # Reset the index to make icustayid a column again
+        patient_df = patient_df.reset_index()
+        
+        # Handle any NaN values from the aggregation
+        patient_df = patient_df.fillna(method='ffill')
+        
+        return patient_df
     
-    def preprocess_data(self, df: pd.DataFrame) -> pd.DataFrame:
+    def train_model(self, test_size: float = 0.2, random_state: int = 42):
         """
-        Preprocess data for model training or prediction.
+        Train a CatBoost model for mortality prediction.
         
         Args:
-            df: DataFrame to preprocess
-            
-        Returns:
-            Preprocessed DataFrame
-        """
-        # Create a copy to avoid modifying the original
-        processed_df = df.copy()
-        
-        # Convert zeros to NaN where they likely represent missing values
-        for col, treat_as_missing in self.zero_as_missing.items():
-            if col in processed_df.columns and treat_as_missing:
-                processed_df.loc[processed_df[col] == 0, col] = np.nan
-        
-        # Group by patient ID and aggregate time series data
-        if 'icustayid' in processed_df.columns:
-            # Define aggregation functions for different types of features
-            agg_functions = {}
-            
-            for col in processed_df.columns:
-                if col in self.non_features:
-                    if col == 'mortality_90d':
-                        # If this is the target variable, use the first value (should be the same for all records)
-                        agg_functions[col] = 'first'
-                    continue
-                
-                if not pd.api.types.is_numeric_dtype(processed_df[col]):
-                    # For non-numeric columns, use the most common value
-                    agg_functions[col] = pd.Series.mode
-                else:
-                    # For numeric features, calculate various statistics
-                    agg_functions[col] = ['mean', 'min', 'max', 'std', 'last']
-            
-            # Apply aggregation
-            grouped_df = processed_df.groupby('icustayid').agg(agg_functions)
-            
-            # Flatten multi-index columns
-            if isinstance(grouped_df.columns, pd.MultiIndex):
-                grouped_df.columns = ['_'.join(col).strip() for col in grouped_df.columns.values]
-            
-            # Reset index to make icustayid a column again
-            grouped_df = grouped_df.reset_index()
-            
-            # Calculate the count of non-null values for each feature
-            for col in processed_df.columns:
-                if col in self.non_features or not pd.api.types.is_numeric_dtype(processed_df[col]):
-                    continue
-                
-                count_col = f"{col}_count"
-                grouped_df[count_col] = processed_df.groupby('icustayid')[col].count().values
-                
-                # Calculate percentage of missing values
-                total_records = processed_df.groupby('icustayid').size().values
-                grouped_df[f"{col}_missing_pct"] = 100 * (1 - grouped_df[count_col] / total_records)
-            
-            return grouped_df
-        
-        return processed_df
-    
-    def train_model(self, test_size: float = 0.2, random_state: int = 42) -> Dict[str, Any]:
-        """
-        Train the mortality prediction model.
-        
-        Args:
-            test_size: Fraction of data to use for testing
+            test_size: Proportion of data to use for testing
             random_state: Random seed for reproducibility
-            
-        Returns:
-            Dictionary with training results
         """
-        # Preprocess data
-        processed_df = self.preprocess_data(self.train_df)
+        print("Training mortality prediction model...")
         
-        # Check if mortality_90d is in the preprocessed data
-        if 'mortality_90d' not in processed_df.columns and 'mortality_90d_first' not in processed_df.columns:
-            raise ValueError("Target variable not found in preprocessed data")
+        # Get aggregated patient data
+        patient_df = self.get_aggregated_patient_data()
         
-        # Use mortality_90d or mortality_90d_first as the target
-        target_col = 'mortality_90d' if 'mortality_90d' in processed_df.columns else 'mortality_90d_first'
+        # Check if mortality_90d exists
+        if 'mortality_90d_first' in patient_df.columns:
+            target_col = 'mortality_90d_first'
+        elif 'mortality_90d' in patient_df.columns:
+            target_col = 'mortality_90d'
+        else:
+            raise ValueError("Target column 'mortality_90d' not found in dataset")
         
-        # Get feature columns (numeric columns not in non_features list)
-        feature_cols = [col for col in processed_df.columns 
-                       if col != target_col 
-                       and col != 'icustayid'  # Exclude patient ID
-                       and not any(nf in col for nf in self.non_features)  # Exclude derived columns from non_features
-                       and pd.api.types.is_numeric_dtype(processed_df[col])]  # Only numeric columns
+        # Define features to use (excluding the target and icustayid)
+        feature_cols = [col for col in patient_df.columns 
+                      if col != target_col and col != 'icustayid'
+                      and pd.api.types.is_numeric_dtype(patient_df[col])]
         
-        # Split data into features and target
-        X = processed_df[feature_cols]
-        y = processed_df[target_col].astype(int)
+        # Split the data into training and testing sets
+        X = patient_df[feature_cols]
+        y = patient_df[target_col].astype(int)
         
-        # Split into training and testing sets
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=random_state, stratify=y)
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=test_size, random_state=random_state, stratify=y
+        )
         
-        # Create preprocessing pipeline with imputation and scaling
-        numeric_transformer = Pipeline(steps=[
+        # Create a preprocessing pipeline
+        preprocessor = Pipeline([
             ('imputer', SimpleImputer(strategy='median')),
             ('scaler', StandardScaler())
         ])
         
-        preprocessor = ColumnTransformer(
-            transformers=[
-                ('num', numeric_transformer, feature_cols)
-            ])
+        # Fit the preprocessor on the training data
+        X_train_processed = preprocessor.fit_transform(X_train)
+        X_test_processed = preprocessor.transform(X_test)
         
-        # Create model
-        if self.model_type == 'random_forest':
-            model = RandomForestClassifier(n_estimators=100, 
-                                          random_state=random_state, 
-                                          class_weight='balanced')
-        elif self.model_type == 'gradient_boosting':
-            model = GradientBoostingClassifier(n_estimators=100, 
-                                               random_state=random_state)
-        elif self.model_type == 'logistic_regression':
-            model = LogisticRegression(random_state=random_state, 
-                                      class_weight='balanced', 
-                                      max_iter=1000)
-        else:
-            raise ValueError(f"Unknown model type: {self.model_type}")
+        # Initialize and train the CatBoost model
+        catboost_model = cb.CatBoostClassifier(
+            iterations=500,
+            learning_rate=0.05,
+            depth=6,
+            loss_function='Logloss',
+            eval_metric='F1',
+            random_seed=random_state,
+            verbose=50
+        )
         
-        # Create pipeline
-        pipeline = Pipeline(steps=[
+        # Train the model
+        catboost_model.fit(
+            X_train_processed, y_train,
+            eval_set=(X_test_processed, y_test),
+            early_stopping_rounds=50
+        )
+        
+        # Create a calibrated model to get better probability estimates
+        calibrated_model = CalibratedClassifierCV(
+            catboost_model, 
+            method='sigmoid', 
+            cv='prefit'
+        )
+        calibrated_model.fit(X_test_processed, y_test)
+        
+        # Evaluate the model
+        y_pred_proba = calibrated_model.predict_proba(X_test_processed)[:, 1]
+        y_pred = (y_pred_proba >= self.threshold).astype(int)
+        
+        accuracy = (y_pred == y_test).mean()
+        f1 = f1_score(y_test, y_pred)
+        auc = roc_auc_score(y_test, y_pred_proba)
+        
+        print(f"Model evaluation results:")
+        print(f"Accuracy: {accuracy:.4f}")
+        print(f"F1 Score: {f1:.4f}")
+        print(f"ROC AUC: {auc:.4f}")
+        print("\nClassification Report:")
+        print(classification_report(y_test, y_pred))
+        
+        # Get feature importance
+        feature_importance = catboost_model.get_feature_importance(type='PredictionValuesChange')
+        self.feature_importance = {feature_cols[i]: float(importance) 
+                                 for i, importance in enumerate(feature_importance)}
+        
+        # Store the trained model and preprocessor
+        self.model = Pipeline([
             ('preprocessor', preprocessor),
-            ('model', model)
+            ('model', calibrated_model)
         ])
         
-        # Train model
-        pipeline.fit(X_train, y_train)
+        self.preprocessor = preprocessor
+        self.feature_names = feature_cols
         
-        # Store model and preprocessing components
-        self.model = pipeline
-        self.imputer = pipeline.named_steps['preprocessor'].named_transformers_['num'].named_steps['imputer']
-        self.scaler = pipeline.named_steps['preprocessor'].named_transformers_['num'].named_steps['scaler']
+        print("Model training complete.")
+    
+    def save_model(self, model_path: str):
+        """
+        Save the trained model to a file.
         
-        # Make predictions on test set
-        y_pred = pipeline.predict(X_test)
-        y_pred_proba = pipeline.predict_proba(X_test)[:, 1]
+        Args:
+            model_path: Path to save the model
+        """
+        if self.model is None:
+            raise ValueError("No trained model to save")
         
-        # Calculate performance metrics
-        performance = {
-            'accuracy': float(accuracy_score(y_test, y_pred)),
-            'precision': float(precision_score(y_test, y_pred)),
-            'recall': float(recall_score(y_test, y_pred)),
-            'f1': float(f1_score(y_test, y_pred)),
-            'auc': float(roc_auc_score(y_test, y_pred_proba))
+        # Create a dictionary with all components to save
+        model_data = {
+            'model': self.model,
+            'feature_names': self.feature_names,
+            'feature_importance': self.feature_importance,
+            'threshold': self.threshold
         }
         
-        # Store performance metrics
-        self.model_performance = performance
+        # Save to file
+        with open(model_path, 'wb') as f:
+            pickle.dump(model_data, f)
         
-        # Calculate feature importance
-        if self.model_type in ['random_forest', 'gradient_boosting']:
-            # For tree-based models, use feature_importances_
-            importances = pipeline.named_steps['model'].feature_importances_
-            feature_importance = dict(zip(feature_cols, importances))
+        print(f"Model saved to {model_path}")
+    
+    def load_model(self, model_path: str):
+        """
+        Load a trained model from a file.
+        
+        Args:
+            model_path: Path to the saved model
+        """
+        try:
+            with open(model_path, 'rb') as f:
+                model_data = pickle.load(f)
             
-            # Sort by importance
-            feature_importance = {k: float(v) for k, v in sorted(feature_importance.items(), 
-                                                               key=lambda x: x[1], 
-                                                               reverse=True)}
-        
-        elif self.model_type == 'logistic_regression':
-            # For logistic regression, use coefficients
-            coefficients = pipeline.named_steps['model'].coef_[0]
-            feature_importance = dict(zip(feature_cols, abs(coefficients)))
+            self.model = model_data['model']
             
-            # Sort by absolute importance
-            feature_importance = {k: float(v) for k, v in sorted(feature_importance.items(), 
-                                                               key=lambda x: x[1], 
-                                                               reverse=True)}
-        
-        # Store feature importance
-        self.feature_importance = feature_importance
-        
-        return {
-            'model_type': self.model_type,
-            'performance': performance,
-            'feature_importance': feature_importance,
-            'num_features': len(feature_cols),
-            'train_size': len(X_train),
-            'test_size': len(X_test),
-            'class_balance': {
-                'train': dict(pd.Series(y_train).value_counts(normalize=True)),
-                'test': dict(pd.Series(y_test).value_counts(normalize=True))
-            }
-        }
+            # Handle potentially missing keys with defaults
+            if 'feature_names' in model_data:
+                self.feature_names = model_data['feature_names']
+            elif hasattr(self.model, 'feature_names_in_'):
+                # Try to get feature names from model if available
+                self.feature_names = self.model.feature_names_in_
+            elif hasattr(self.model, 'named_steps') and 'model' in self.model.named_steps:
+                if hasattr(self.model.named_steps['model'], 'feature_names_in_'):
+                    self.feature_names = self.model.named_steps['model'].feature_names_in_
+                # For CatBoost models
+                elif hasattr(self.model.named_steps['model'], 'feature_names_'):
+                    self.feature_names = self.model.named_steps['model'].feature_names_
+            
+            # If we still don't have feature names, use a placeholder
+            if self.feature_names is None:
+                print("Warning: Could not find feature names in the model. Using placeholder names.")
+                if hasattr(self.model, 'n_features_in_'):
+                    self.feature_names = [f'feature_{i}' for i in range(self.model.n_features_in_)]
+                else:
+                    # Default to common sepsis features
+                    self.feature_names = ['GCS', 'HR', 'SysBP', 'MeanBP', 'RR', 'SpO2', 
+                                         'Temp_C', 'SOFA', 'Arterial_lactate', 'age']
+            
+            # Handle feature importance
+            if 'feature_importance' in model_data:
+                self.feature_importance = model_data['feature_importance']
+            else:
+                # Create default feature importance if missing
+                print("Warning: Feature importance not found. Using equal importance.")
+                self.feature_importance = {f: 1.0/len(self.feature_names) for f in self.feature_names}
+            
+            # Get threshold
+            self.threshold = model_data.get('threshold', 0.5)
+            
+            print(f"Model loaded from {model_path}")
+        except Exception as e:
+            print(f"Error loading model: {str(e)}")
+            # Instead of raising, initialize with defaults
+            print("Initializing with default values due to model loading error")
+            self.model = None
+            self.feature_names = None
+            self.feature_importance = {}
+            self.threshold = 0.5
     
     def predict_mortality(self, patient_data: Union[pd.DataFrame, Dict[str, Any]]) -> Dict[str, Any]:
         """
@@ -306,9 +311,8 @@ class PredictionTool:
         Returns:
             Dictionary with prediction results
         """
-        # Check if model is trained
         if self.model is None:
-            self.train_model()
+            raise ValueError("Model has not been trained or loaded")
         
         # Convert dictionary to DataFrame if needed
         if isinstance(patient_data, dict):
@@ -316,212 +320,75 @@ class PredictionTool:
         else:
             patient_df = patient_data.copy()
         
-        # Preprocess data
-        processed_df = self.preprocess_data(patient_df)
-        
-        # Get feature columns used by the model
-        feature_cols = list(self.feature_importance.keys())
-        
-        # Check if all required features are present
-        missing_features = [col for col in feature_cols if col not in processed_df.columns]
-        if missing_features:
-            # If features are missing, add them with NaN values
-            for col in missing_features:
-                processed_df[col] = np.nan
-        
-        # Select only the features used by the model
-        X = processed_df[feature_cols]
-        
-        # Make prediction
-        mortality_proba = self.model.predict_proba(X)[0, 1]
-        mortality_class = 1 if mortality_proba >= 0.5 else 0
-        
-        # Get patient ID if available
-        patient_id = None
-        if 'icustayid' in processed_df.columns:
-            patient_id = processed_df['icustayid'].iloc[0]
-        
-        # Get top contributing features
-        contributing_features = self.get_contributing_features(X, top_n=5)
-        
-        return {
-            'patient_id': patient_id,
-            'mortality_probability': float(mortality_proba),
-            'mortality_class': int(mortality_class),
-            'confidence': float(max(mortality_proba, 1 - mortality_proba)),
-            'contributing_features': contributing_features
-        }
-    
-    def get_contributing_features(self, X: pd.DataFrame, top_n: int = 5) -> List[Dict[str, Any]]:
-        """
-        Get the top contributing features for a prediction.
-        
-        Args:
-            X: Feature DataFrame for a single patient
-            top_n: Number of top features to return
+        # For time series data, aggregate to get one record per patient
+        if 'icustayid' in patient_df.columns and len(patient_df) > 1:
+            patient_id = patient_df['icustayid'].iloc[0]
+            print(f"Aggregating time series data for patient {patient_id}")
             
-        Returns:
-            List of dictionaries with feature contribution information
-        """
-        # Check if model is trained
-        if self.model is None or not self.feature_importance:
-            return []
+            # Create aggregations for each feature
+            agg_dict = {}
+            for feature in self.features_to_use:
+                if feature in patient_df.columns:
+                    agg_dict[feature] = ['mean', 'min', 'max', 'std', 'last']
+            
+            # Perform aggregation
+            agg_df = patient_df.groupby('icustayid').agg(agg_dict)
+            
+            # Flatten the column names
+            agg_df.columns = ['_'.join(col).strip() for col in agg_df.columns.values]
+            
+            # Reset the index to make icustayid a column again
+            agg_df = agg_df.reset_index()
+            
+            # Use the aggregated data for prediction
+            patient_df = agg_df
         
-        # Get feature values
-        feature_values = X.iloc[0].to_dict()
-        
-        if self.model_type == 'logistic_regression':
-            # For logistic regression, get raw coefficients (not absolute values)
-            coefficients = self.model.named_steps['model'].coef_[0]
-            feature_importance = dict(zip(X.columns, coefficients))
-            
-            # Calculate contribution (coefficient * feature value)
-            contributions = {}
-            for feature, coef in feature_importance.items():
-                value = feature_values[feature]
-                if pd.isna(value):
-                    # For missing values, use the imputed value
-                    value = self.imputer.statistics_[list(X.columns).index(feature)]
-                
-                # Scale the value
-                scaled_value = (value - self.scaler.mean_[list(X.columns).index(feature)]) / self.scaler.scale_[list(X.columns).index(feature)]
-                
-                contributions[feature] = float(coef * scaled_value)
-            
-            # Sort by absolute contribution
-            sorted_contributions = sorted(contributions.items(), key=lambda x: abs(x[1]), reverse=True)
-            
-            # Get top contributing features
-            top_features = []
-            for feature, contribution in sorted_contributions[:top_n]:
-                direction = 'positive' if contribution > 0 else 'negative'
-                top_features.append({
-                    'feature': feature,
-                    'contribution': float(contribution),
-                    'direction': direction,
-                    'value': float(feature_values[feature]) if not pd.isna(feature_values[feature]) else None,
-                    'imputed': pd.isna(feature_values[feature])
-                })
-            
-            return top_features
-        
-        else:
-            # For tree-based models, use feature importance
-            # Sort features by importance
-            sorted_importance = sorted(self.feature_importance.items(), key=lambda x: x[1], reverse=True)
-            
-            # Get top important features
-            top_features = []
-            for feature, importance in sorted_importance[:top_n]:
-                # Determine if the feature value is abnormal
-                value = feature_values[feature]
-                imputed = pd.isna(value)
-                
-                if imputed:
-                    # For missing values, use the imputed value
-                    value = self.imputer.statistics_[list(X.columns).index(feature)]
-                
-                # Determine direction of impact based on feature value compared to average
-                avg_value = self.train_df[feature].mean() if feature in self.train_df else None
-                
-                if avg_value is not None and not pd.isna(avg_value):
-                    direction = 'high' if value > avg_value else 'low'
+        # Prepare features for prediction
+        # Find overlapping features between the model and patient data
+        if len(patient_df.columns.intersection(self.feature_names)) == 0:
+            # No direct feature match, try checking for aggregate features
+            # (e.g., feature_mean, feature_max, etc.)
+            feature_cols = []
+            for feat in self.feature_names:
+                if feat in patient_df.columns:
+                    feature_cols.append(feat)
                 else:
-                    direction = 'unknown'
-                
-                top_features.append({
-                    'feature': feature,
-                    'importance': float(importance),
-                    'value': float(value),
-                    'avg_value': float(avg_value) if avg_value is not None and not pd.isna(avg_value) else None,
-                    'direction': direction,
-                    'imputed': imputed
-                })
-            
-            return top_features
-    
-    def get_model_card(self) -> str:
-        """
-        Generate a human-readable model card with information about the trained model.
+                    # If the base feature is not in the data but aggregations are
+                    base_feat = feat.split('_')[0]
+                    for col in patient_df.columns:
+                        if col.startswith(base_feat + '_'):
+                            feature_cols.append(col)
+                            break
+        else:
+            # Use the intersection of features
+            feature_cols = list(set(self.feature_names).intersection(patient_df.columns))
         
-        Returns:
-            Text model card
-        """
-        # Check if model is trained
-        if self.model is None:
-            return "Model has not been trained yet."
+        # If still no matching features, raise an error
+        if not feature_cols:
+            raise ValueError("No matching features found between the model and patient data")
         
-        # Build model card
-        card = []
-        card.append("# Sepsis Mortality Prediction Model Card\n")
-        
-        # Model details
-        card.append("## Model Details")
-        card.append(f"- Model type: {self.model_type}")
-        card.append(f"- Number of features: {len(self.feature_importance)}")
-        card.append(f"- Task: Binary classification (90-day mortality prediction)")
-        card.append(f"- Framework: scikit-learn")
-        
-        # Model performance
-        card.append("\n## Model Performance")
-        for metric, value in self.model_performance.items():
-            card.append(f"- {metric.capitalize()}: {value:.4f}")
-        
-        # Feature importance
-        card.append("\n## Important Features")
-        
-        # Get top 10 features
-        top_features = list(self.feature_importance.items())[:10]
-        
-        for feature, importance in top_features:
-            if '_mean' in feature:
-                base_feature = feature.replace('_mean', '')
-                card.append(f"- {base_feature} (mean): {importance:.4f}")
-            elif '_max' in feature:
-                base_feature = feature.replace('_max', '')
-                card.append(f"- {base_feature} (maximum): {importance:.4f}")
-            elif '_min' in feature:
-                base_feature = feature.replace('_min', '')
-                card.append(f"- {base_feature} (minimum): {importance:.4f}")
+        # Align the feature order with the model's expected features
+        # and fill missing features with NaN
+        X = pd.DataFrame(index=patient_df.index)
+        for feature in self.feature_names:
+            if feature in patient_df.columns:
+                X[feature] = patient_df[feature]
             else:
-                card.append(f"- {feature}: {importance:.4f}")
+                X[feature] = np.nan
         
-        # Limitations and ethical considerations
-        card.append("\n## Limitations")
-        card.append("- The model is trained on a specific dataset and may not generalize to patients from different populations or hospitals.")
-        card.append("- Missing data is imputed, which may introduce bias or uncertainty in predictions.")
-        card.append("- The model provides probabilities but does not account for all possible clinical factors.")
-        card.append("- The model should be used as a decision support tool, not as a replacement for clinical judgment.")
-        
-        # Usage recommendations
-        card.append("\n## Recommended Use")
-        card.append("- This model is intended to support clinical decision-making by providing an objective assessment of mortality risk.")
-        card.append("- The model should be used in conjunction with clinical expertise, not as a standalone diagnostic tool.")
-        card.append("- Predictions should be interpreted in the context of the patient's full clinical picture.")
-        card.append("- The contributing factors identified by the model can help guide clinical focus to the most critical aspects of a patient's condition.")
-        
-        return "\n".join(card)
-    
-    def generate_patient_report(self, patient_data: Union[pd.DataFrame, Dict[str, Any]]) -> str:
-        """
-        Generate a human-readable report for a patient's mortality prediction.
-        
-        Args:
-            patient_data: DataFrame or dictionary with patient data
-            
-        Returns:
-            Text report
-        """
         # Make prediction
-        prediction = self.predict_mortality(patient_data)
+        if hasattr(self.model, 'predict_proba'):
+            mortality_prob = self.model.predict_proba(X)[:, 1][0]
+        else:
+            # For pipeline models
+            mortality_prob = self.model.predict_proba(X)[:, 1][0]
         
-        # Build report
-        report = []
-        report.append("# Sepsis Mortality Risk Assessment\n")
+        # Determine binary prediction based on threshold
+        mortality_class = int(mortality_prob >= self.threshold)
         
-        # Prediction result
-        mortality_prob = prediction['mortality_probability']
-        mortality_class = prediction['mortality_class']
+        # Calculate confidence (simplistic approach - distance from threshold)
+        # A more sophisticated approach would use calibration or conformal prediction
+        confidence = 1.0 - 2.0 * abs(mortality_prob - 0.5)
         
         # Determine risk level
         if mortality_prob < 0.25:
@@ -533,78 +400,468 @@ class PredictionTool:
         else:
             risk_level = "Very High"
         
-        # Summary
-        report.append("## Summary")
-        report.append(f"- **Risk Level**: {risk_level}")
-        report.append(f"- **90-day Mortality Risk**: {mortality_prob:.1%}")
-        report.append(f"- **Prediction**: {'Higher risk of mortality' if mortality_class == 1 else 'Lower risk of mortality'}")
-        report.append(f"- **Confidence**: {prediction['confidence']:.1%}")
+        # Get patient ID if available
+        patient_id = None
+        if 'icustayid' in patient_df.columns:
+            patient_id = int(patient_df['icustayid'].iloc[0])
         
-        # Key factors
-        report.append("\n## Key Risk Factors")
+        # Get feature contributions
+        contributing_features = self._get_feature_contributions(X)
         
-        for factor in prediction['contributing_features']:
-            feature = factor['feature']
-            
-            # Clean up feature name
-            if '_mean' in feature:
-                base_feature = feature.replace('_mean', '')
-                feature_type = "average"
-            elif '_max' in feature:
-                base_feature = feature.replace('_max', '')
-                feature_type = "maximum"
-            elif '_min' in feature:
-                base_feature = feature.replace('_min', '')
-                feature_type = "minimum"
-            elif '_last' in feature:
-                base_feature = feature.replace('_last', '')
-                feature_type = "most recent"
-            # else:
-            #     base
-
-    def save_model(self, filepath: str) -> None:
+        # Return prediction results
+        return {
+            "patient_id": patient_id,
+            "mortality_probability": float(mortality_prob),
+            "mortality_class": mortality_class,
+            "risk_level": risk_level,
+            "confidence": float(confidence),
+            "contributing_features": contributing_features
+        }
+    
+    def _get_feature_contributions(self, X: pd.DataFrame) -> List[Dict[str, Any]]:
         """
-        Save the trained model to disk.
+        Calculate feature contributions to the prediction.
         
         Args:
-            filepath: Path where the model should be saved
+            X: Feature DataFrame for a patient
+            
+        Returns:
+            List of dictionaries with feature contribution information
+        """
+        # Get the top 10 most important features from the model
+        sorted_features = sorted(
+            self.feature_importance.items(), 
+            key=lambda x: abs(x[1]), 
+            reverse=True
+        )[:10]
+        
+        contributions = []
+        
+        for feature_name, importance in sorted_features:
+            # Skip if feature doesn't exist in the input
+            if feature_name not in X.columns:
+                continue
+                
+            # Get the feature value
+            value = X[feature_name].iloc[0]
+            
+            # Skip if value is missing
+            if pd.isna(value):
+                continue
+                
+            # Determine direction based on feature value and importance
+            # This is a simplistic approach - in a real system, you'd use SHAP or similar
+            # For now, we're using the feature importance and comparing to global average
+            
+            # Get average value from preprocessor if available
+            if hasattr(self.model, 'named_steps') and 'preprocessor' in self.model.named_steps:
+                avg_value = self.model.named_steps['preprocessor'].steps[0][1].statistics_[
+                    list(X.columns).index(feature_name)
+                ]
+            else:
+                # Fallback to simple comparison with 0
+                avg_value = 0.0
+            
+            # Determine direction
+            if importance > 0:
+                # Positive contribution to risk
+                direction = "high" if value > avg_value else "low"
+            else:
+                # Negative contribution to risk
+                direction = "low" if value > avg_value else "high"
+                
+            # Check if the feature was imputed (a more sophisticated system would track this)
+            imputed = False  # Placeholder - in a real system, track imputations
+                
+            contributions.append({
+                "feature": feature_name,
+                "importance": abs(importance) / max(abs(imp) for _, imp in sorted_features),  # Normalize
+                "value": float(value),
+                "avg_value": float(avg_value),
+                "direction": direction,
+                "imputed": imputed
+            })
+        
+        return contributions
+    
+    def generate_patient_report(self, patient_df: pd.DataFrame) -> str:
+        """
+        Generate a comprehensive report for a patient.
+        
+        Args:
+            patient_df: DataFrame with patient data
+            
+        Returns:
+            String containing the report
+        """
+        # Make prediction
+        prediction = self.predict_mortality(patient_df)
+        
+        # Extract key information
+        patient_id = prediction.get("patient_id", "Unknown")
+        mortality_prob = prediction["mortality_probability"]
+        risk_level = prediction["risk_level"]
+        confidence = prediction["confidence"]
+        contributing_features = prediction["contributing_features"]
+        
+        # Build report
+        report = []
+        report.append(f"# Mortality Risk Assessment Report for Patient {patient_id}")
+        report.append("")
+        
+        # Summary section
+        report.append("Summary")
+        report.append(f"\n**Risk Level**: {risk_level}\n")
+        report.append(f"\n**90-day Mortality Risk**: {mortality_prob:.1%}")
+        # report.append(f"- **Prediction Confidence**: {confidence:.1%}")
+        report.append("")
+        
+        # Key risk factors
+        report.append("## Key Risk Factors")
+        
+        # Sort contributing features by importance
+        sorted_features = sorted(contributing_features, key=lambda x: x['importance'], reverse=True)
+        
+        for idx, feature in enumerate(sorted_features[:5]):  # Show top 5 features
+            feature_name = feature['feature'].replace('_', ' ').title()
+            value = feature['value']
+            avg_value = feature['avg_value']
+            direction = feature['direction']
+            importance = feature['importance']
+            
+            # Format the feature name nicely
+            for suffix in ['_mean', '_max', '_min', '_last', '_std']:
+                if feature_name.lower().endswith(suffix):
+                    metric_type = suffix.strip('_').title()
+                    base_name = feature_name[:-len(suffix)].strip()
+                    feature_name = f"{base_name} ({metric_type})"
+            
+            # Create description of feature impact
+            if direction == "high":
+                impact = "higher"
+                comparison = "above"
+            else:
+                impact = "lower"
+                comparison = "below"
+            
+            # Format importance as percentage
+            importance_pct = importance * 100
+            
+            report.append(f"### {idx+1}. {feature_name}")
+            report.append(f"- **Value**: {value:.2f} ({comparison} average of {avg_value:.2f})")
+            report.append(f"- **Impact**: Contributes to {impact} risk of mortality")
+            report.append(f"- **Importance**: {importance_pct:.1f}% contribution to prediction")
+            report.append("")
+        
+        # Missing data section if relevant
+        missing_features = [f for f in self.feature_names if f not in patient_df.columns 
+                          or patient_df[f].isna().all()]
+        
+        if missing_features:
+            report.append("## Missing Data")
+            report.append("The following important data points were missing and had to be estimated:")
+            
+            # Find important missing features
+            important_missing = []
+            for feature in missing_features:
+                if feature in self.feature_importance:
+                    importance = abs(self.feature_importance[feature])
+                    important_missing.append((feature, importance))
+            
+            # Sort by importance and show top 5
+            sorted_missing = sorted(important_missing, key=lambda x: x[1], reverse=True)[:5]
+            
+            for feature, importance in sorted_missing:
+                feature_name = feature.replace('_', ' ').title()
+                report.append(f"- {feature_name}")
+            
+            # Add impact assessment
+            if len(sorted_missing) > 2:
+                report.append("\nThe missing data may significantly affect the reliability of this prediction.")
+            else:
+                report.append("\nThe missing data is unlikely to significantly affect the prediction.")
+        
+        # Recommendations section
+        report.append("## Clinical Recommendations")
+        
+        if risk_level == "Low":
+            report.append("- Regular monitoring according to standard protocols")
+            report.append("- Continue current treatment plan")
+            report.append("- Reassess if clinical status changes")
+        elif risk_level == "Moderate":
+            report.append("- Increased monitoring frequency")
+            report.append("- Consider additional diagnostic tests")
+            report.append("- Review medication and treatment efficacy")
+        elif risk_level == "High":
+            report.append("- Frequent monitoring of vital signs and lab values")
+            report.append("- Consider ICU admission if not already there")
+            report.append("- Aggressive treatment of underlying conditions")
+            report.append("- Early intervention for any new symptoms")
+        else:  # Very High
+            report.append("- Intensive monitoring")
+            report.append("- ICU level care")
+            report.append("- Aggressive intervention for organ support")
+            report.append("- Consider discussion about goals of care")
+        
+        # Disclaimer
+        report.append("\n## Disclaimer")
+        report.append("This prediction is based on statistical analysis and should be used as a decision support tool only. "
+                     "Clinical judgment should always take precedence. The model does not account for all possible "
+                     "clinical factors and may have limitations in certain patient populations.")
+        
+        return "\n".join(report)
+    
+    def get_model_card(self) -> str:
+        """
+        Generate a model card describing the prediction model.
+        
+        Returns:
+            String containing the model description
         """
         if self.model is None:
-            raise ValueError("Model has not been trained yet")
+            return "No model has been trained or loaded yet."
         
-        with open(filepath, 'wb') as f:
-            pickle.dump({
-                'model': self.model,
-                'model_type': self.model_type,
-                'feature_importance': self.feature_importance,
-                'model_performance': self.model_performance,
-                'zero_as_missing': self.zero_as_missing
-            }, f)
+        model_card = []
+        model_card.append("# Sepsis Mortality Prediction Model Card")
+        model_card.append("")
+        
+        # Model overview
+        model_card.append("## Model Overview")
+        
+        # Determine the base classifier type
+        if hasattr(self.model, 'named_steps') and 'model' in self.model.named_steps:
+            if hasattr(self.model.named_steps['model'], 'estimator'):
+                base_model = self.model.named_steps['model'].estimator
+                model_type = str(type(base_model)).split("'")[1].split(".")[-1]
+            else:
+                model_type = str(type(self.model.named_steps['model'])).split("'")[1].split(".")[-1]
+        else:
+            model_type = str(type(self.model)).split("'")[1].split(".")[-1]
+        
+        model_card.append(f"- **Model Type**: {model_type}")
+        model_card.append(f"- **Features Used**: {len(self.feature_names)} clinical variables")
+        model_card.append(f"- **Target**: 90-day mortality after ICU admission")
+        model_card.append(f"- **Classification Threshold**: {self.threshold}")
+        model_card.append("")
+        
+        # Top features
+        model_card.append("## Top Predictive Features")
+        
+        # Sort features by importance
+        sorted_features = sorted(
+            self.feature_importance.items(), 
+            key=lambda x: abs(x[1]), 
+            reverse=True
+        )[:10]  # Top 10 features
+        
+        for feature_name, importance in sorted_features:
+            # Format feature name nicely
+            display_name = feature_name.replace('_', ' ').title()
+            for suffix in ['_mean', '_max', '_min', '_last', '_std']:
+                if display_name.lower().endswith(suffix):
+                    metric_type = suffix.strip('_').title()
+                    base_name = display_name[:-len(suffix)].strip()
+                    display_name = f"{base_name} ({metric_type})"
+            
+            # Direction of influence
+            direction = "increases" if importance > 0 else "decreases"
+            
+            # Normalize importance for display
+            norm_importance = abs(importance) / max(abs(imp) for _, imp in sorted_features)
+            stars = "★" * int(round(norm_importance * 5))
+            
+            model_card.append(f"- {display_name}: {stars} ({direction} risk)")
+        
+        model_card.append("")
+        
+        # Intended use
+        model_card.append("## Intended Use")
+        model_card.append("This model is designed to provide decision support for clinical teams treating patients with "
+                         "sepsis in the ICU. It predicts the risk of mortality within 90 days based on clinical "
+                         "variables including vital signs, laboratory values, and treatment parameters.")
+        model_card.append("")
+        model_card.append("The model should be used as one of several tools to inform clinical decision-making, "
+                         "not as the sole basis for treatment decisions.")
+        model_card.append("")
+        
+        # Limitations
+        model_card.append("## Limitations")
+        model_card.append("- The model was trained on historical data and may not reflect changes in treatment protocols.")
+        model_card.append("- Predictions are based on available data and may be less reliable when important measurements are missing.")
+        model_card.append("- The model does not account for all possible clinical factors that might influence mortality.")
+        model_card.append("- Performance may vary across different patient populations or institutions.")
+        model_card.append("")
+        
+        # Usage guidelines
+        model_card.append("## Usage Guidelines")
+        model_card.append("- Always interpret predictions in the context of the patient's full clinical picture.")
+        model_card.append("- Consider the confidence level when evaluating predictions.")
+        model_card.append("- Use the model to identify patients who may benefit from increased monitoring or intervention.")
+        model_card.append("- Regularly validate model performance with new data.")
+        model_card.append("")
+        
+        return "\n".join(model_card)
     
-    def load_model(self, filepath: str) -> None:
+    def plot_feature_importance(self) -> str:
         """
-        Load a trained model from disk.
+        Generate a feature importance plot and return it as a base64 encoded image.
         
-        Args:
-            filepath: Path to the saved model
+        Returns:
+            Base64 encoded image
         """
-        with open(filepath, 'rb') as f:
-            data = pickle.load(f)
+        if not self.feature_importance:
+            return None
         
-        self.model = data['model']
-        self.model_type = data['model_type']
-        self.feature_importance = data['feature_importance']
-        self.model_performance = data['model_performance']
-        self.zero_as_missing = data['zero_as_missing']
+        # Sort features by importance
+        sorted_features = sorted(
+            self.feature_importance.items(), 
+            key=lambda x: abs(x[1]), 
+            reverse=True
+        )[:15]  # Top 15 features
         
-        # Extract preprocessing components
-        if hasattr(self.model, 'named_steps'):
-            if 'preprocessor' in self.model.named_steps:
-                preprocessor = self.model.named_steps['preprocessor']
-                if hasattr(preprocessor, 'named_transformers_') and 'num' in preprocessor.named_transformers_:
-                    numeric_transformer = preprocessor.named_transformers_['num']
-                    if hasattr(numeric_transformer, 'named_steps'):
-                        if 'imputer' in numeric_transformer.named_steps:
-                            self.imputer = numeric_transformer.named_steps['imputer']
-                        if 'scaler' in numeric_transformer.named_steps:
-                            self.scaler = numeric_transformer.named_steps['scaler']
+        # Unpack for plotting
+        feature_names = []
+        importance_values = []
+        
+        for feature_name, importance in sorted_features:
+            # Format feature name nicely
+            display_name = feature_name.replace('_', ' ').title()
+            for suffix in ['_mean', '_max', '_min', '_last', '_std']:
+                if display_name.lower().endswith(suffix):
+                    metric_type = suffix.strip('_').title()
+                    base_name = display_name[:-len(suffix)].strip()
+                    display_name = f"{base_name} ({metric_type})"
+            
+            feature_names.append(display_name)
+            importance_values.append(importance)
+        
+        # Create plot
+        plt.figure(figsize=(10, 8))
+        colors = ['#1f77b4' if v > 0 else '#d62728' for v in importance_values]
+        y_pos = range(len(feature_names))
+        
+        plt.barh(y_pos, [abs(v) for v in importance_values], color=colors)
+        plt.yticks(y_pos, feature_names)
+        plt.xlabel('Feature Importance')
+        plt.title('Top Features for Mortality Prediction')
+        
+        # Add a legend explaining colors
+        from matplotlib.patches import Patch
+        legend_elements = [
+            Patch(facecolor='#1f77b4', label='Increases Risk'),
+            Patch(facecolor='#d62728', label='Decreases Risk')
+        ]
+        plt.legend(handles=legend_elements, loc='lower right')
+        
+        # Save plot to buffer
+        buf = io.BytesIO()
+        plt.tight_layout()
+        plt.savefig(buf, format='png')
+        plt.close()
+        
+        # Encode as base64
+        buf.seek(0)
+        img_base64 = base64.b64encode(buf.read()).decode('utf-8')
+        
+        return img_base64
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """
+        Convert model information to a dictionary.
+        
+        Returns:
+            Dictionary with model information
+        """
+        model_info = {
+            "model_type": str(type(self.model)).split("'")[1].split(".")[-1] if self.model else None,
+            "num_features": len(self.feature_names) if self.feature_names else 0,
+            "feature_names": self.feature_names,
+            "feature_importance": self.feature_importance,
+            "threshold": self.threshold
+        }
+        
+        return model_info
+
+
+# Example usage (would be wrapped in API endpoint)
+if __name__ == "__main__":
+    # Replace with your actual data path
+    data_path = "./data/AI_agent_train_sepsis.csv"
+    
+    # Initialize the tool
+    prediction_tool = PredictionTool(data_path)
+    
+    # Train the model
+    prediction_tool.train_model()
+    
+    # Save the model
+    prediction_tool.save_model("./model/sepsis_mortality_model.pkl")
+    
+    # Load the model
+    # prediction_tool.load_model("./model/sepsis_mortality_model.pkl")
+    
+    # Get all patient IDs
+    agg_df = prediction_tool.get_aggregated_patient_data()
+    
+    if 'icustayid' in agg_df.columns:
+        patient_ids = agg_df['icustayid'].unique().tolist()
+        
+        if patient_ids:
+            # Predict for the first patient
+            first_patient_id = patient_ids[0]
+            patient_df = agg_df[agg_df['icustayid'] == first_patient_id]
+            
+            # Get prediction
+            prediction = prediction_tool.predict_mortality(patient_df)
+            print(f"\nPrediction for patient {first_patient_id}:")
+            print(json.dumps(prediction, indent=2))
+            
+            # Generate report
+            report = prediction_tool.generate_patient_report(patient_df)
+            print(f"\nReport for patient {first_patient_id}:")
+            print(report)
+            
+            # Plot feature importance
+            importance_plot = prediction_tool.plot_feature_importance()
+            if importance_plot:
+                print("\nFeature importance plot generated (base64 encoded)")
+            
+            # Get model card
+            model_card = prediction_tool.get_model_card()
+            print("\nModel Card:")
+            print(model_card)
+    
+    # Example of how to use the prediction tool with new patient data
+    print("\nExample of using the prediction tool with new patient data:")
+    
+    # Create a sample patient record (this would come from your data source)
+    sample_patient = {
+        'icustayid': 12345,
+        'age_mean': 65.2,
+        'GCS_mean': 12.5,
+        'GCS_min': 10.0,
+        'HR_mean': 95.3,
+        'HR_max': 110.2,
+        'SysBP_mean': 115.8,
+        'SysBP_min': 95.0,
+        'SOFA_max': 6.0,
+        'SOFA_mean': 4.5,
+        'Arterial_lactate_max': 2.1,
+        'Arterial_lactate_mean': 1.8
+    }
+    
+    # Convert to DataFrame
+    sample_df = pd.DataFrame([sample_patient])
+    
+    # Get prediction
+    try:
+        prediction = prediction_tool.predict_mortality(sample_df)
+        print("\nPrediction for sample patient:")
+        print(json.dumps(prediction, indent=2))
+        
+        # Generate report
+        report = prediction_tool.generate_patient_report(sample_df)
+        print("\nReport for sample patient:")
+        print(report)
+    except Exception as e:
+        print(f"Error predicting for sample patient: {str(e)}")

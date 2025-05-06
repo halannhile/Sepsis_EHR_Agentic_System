@@ -73,31 +73,39 @@ class PatientRetrievalTool:
         Returns:
             Dictionary containing patient data and statistics
         """
-        # Check if patient exists
-        if patient_id not in self.get_patient_ids():
+        # Check if patient exists in training data
+        train_patient_exists = 'icustayid' in self.train_df.columns and patient_id in self.train_df['icustayid'].values
+        
+        # Check if patient exists in test data
+        test_patient_exists = (self.test_df is not None and 
+                            'icustayid' in self.test_df.columns and 
+                            patient_id in self.test_df['icustayid'].values)
+        
+        if not train_patient_exists and not test_patient_exists:
             return {"error": f"Patient ID {patient_id} not found in the dataset"}
         
-        # Get all records for this patient from training data
-        patient_df = self.train_df[self.train_df['icustayid'] == patient_id].copy() if 'icustayid' in self.train_df.columns else pd.DataFrame()
-        
-        # If not found in training data or patient data is empty, try test data
-        if len(patient_df) == 0 and self.test_df is not None:
-            patient_df = self.test_df[self.test_df['icustayid'] == patient_id].copy() if 'icustayid' in self.test_df.columns else pd.DataFrame()
+        # Determine which dataset to use
+        if train_patient_exists:
+            df = self.train_df[self.train_df['icustayid'] == patient_id].copy()
+            dataset_source = "training"
+        else:
+            df = self.test_df[self.test_df['icustayid'] == patient_id].copy()
+            dataset_source = "test"
         
         # If still no data, return error
-        if len(patient_df) == 0:
+        if len(df) == 0:
             return {"error": f"No data found for patient ID {patient_id}"}
         
         # Sort by charttime if available
-        if 'charttime' in patient_df.columns:
-            patient_df = patient_df.sort_values('charttime')
+        if 'charttime' in df.columns:
+            df = df.sort_values('charttime')
         
         # Get static information (should be the same across all records)
         static_info = {}
         for col in ['gender', 'age', 'elixhauser', 're_admission']:
-            if col in patient_df.columns:
+            if col in df.columns:
                 # Use first non-null value
-                values = patient_df[col].dropna()
+                values = df[col].dropna()
                 if len(values) > 0:
                     if col == 'age':
                         # Convert age from days to years
@@ -107,12 +115,12 @@ class PatientRetrievalTool:
         
         # Get mortality label if available
         mortality = None
-        if 'mortality_90d' in patient_df.columns:
-            mortality = bool(patient_df['mortality_90d'].iloc[0])
+        if 'mortality_90d' in df.columns:
+            mortality = bool(df['mortality_90d'].iloc[0])
         
         # Get timeline of measurements
         timeline = []
-        for _, row in patient_df.iterrows():
+        for _, row in df.iterrows():
             record = {}
             if 'charttime' in row:
                 record['timestamp'] = row['charttime']
@@ -127,10 +135,10 @@ class PatientRetrievalTool:
             # Add lab results
             lab_results = {}
             for col in ['Potassium', 'Sodium', 'Chloride', 'Glucose', 'BUN', 'Creatinine',
-                       'Magnesium', 'Calcium', 'Ionised_Ca', 'CO2_mEqL', 'SGOT', 'SGPT',
-                       'Total_bili', 'Albumin', 'Hb', 'WBC_count', 'Platelets_count',
-                       'PTT', 'PT', 'INR', 'Arterial_pH', 'paO2', 'paCO2', 'Arterial_BE',
-                       'HCO3', 'Arterial_lactate']:
+                    'Magnesium', 'Calcium', 'Ionised_Ca', 'CO2_mEqL', 'SGOT', 'SGPT',
+                    'Total_bili', 'Albumin', 'Hb', 'WBC_count', 'Platelets_count',
+                    'PTT', 'PT', 'INR', 'Arterial_pH', 'paO2', 'paCO2', 'Arterial_BE',
+                    'HCO3', 'Arterial_lactate']:
                 if col in row and not pd.isna(row[col]):
                     lab_results[col] = row[col]
             record['lab_results'] = lab_results
@@ -138,8 +146,8 @@ class PatientRetrievalTool:
             # Add treatment information
             treatments = {}
             for col in ['FiO2_1', 'mechvent', 'median_dose_vaso', 'max_dose_vaso',
-                       'input_total', 'input_4hourly', 'output_total', 'output_4hourly',
-                       'cumulated_balance']:
+                    'input_total', 'input_4hourly', 'output_total', 'output_4hourly',
+                    'cumulated_balance']:
                 if col in row and not pd.isna(row[col]):
                     treatments[col] = row[col]
             record['treatments'] = treatments
@@ -155,12 +163,12 @@ class PatientRetrievalTool:
         
         # Calculate summary statistics for key variables over time
         summary_stats = {}
-        numeric_cols = [col for col in patient_df.columns if 
-                       pd.api.types.is_numeric_dtype(patient_df[col]) and
-                       col not in ['bloc', 'icustayid', 'mortality_90d']]
+        numeric_cols = [col for col in df.columns if 
+                    pd.api.types.is_numeric_dtype(df[col]) and
+                    col not in ['bloc', 'icustayid', 'mortality_90d']]
         
         for col in numeric_cols:
-            values = patient_df[col].dropna()
+            values = df[col].dropna()
             if len(values) > 0:
                 summary_stats[col] = {
                     'mean': float(values.mean()),
@@ -170,23 +178,24 @@ class PatientRetrievalTool:
                     'last': float(values.iloc[-1]),
                     'trend': float(values.iloc[-1] - values.iloc[0]) if len(values) > 1 else 0,
                     'count': int(len(values)),
-                    'missing': int(patient_df[col].isna().sum()),
+                    'missing': int(df[col].isna().sum()),
                     'zero_count': int((values == 0).sum())
                 }
         
         # Calculate alert flags based on abnormal values
-        alerts = self._calculate_alerts(patient_df)
+        alerts = self._calculate_alerts(df)
         
         # Return complete patient information
         return {
             "patient_id": patient_id,
+            "dataset_source": dataset_source,
             "static_info": static_info,
             "mortality_90d": mortality,
-            "num_records": len(patient_df),
+            "num_records": len(df),
             "timeline": timeline,
             "summary_stats": summary_stats,
             "alerts": alerts,
-            "raw_data": patient_df.to_dict(orient='records')
+            "raw_data": df.to_dict(orient='records')
         }
     
     def _calculate_alerts(self, patient_df: pd.DataFrame) -> List[Dict[str, Any]]:
@@ -287,11 +296,17 @@ class PatientRetrievalTool:
         summary = []
         summary.append(f"# Patient Summary for ID: {patient_id}\n")
         
+        # Add which dataset this patient belongs to
+        if "dataset_source" in data:
+            summary.append(f"- Dataset Source: {data['dataset_source']} dataset")
+        
         # Patient demographics
         static_info = data["static_info"]
         summary.append("## Patient Information")
         if "gender" in static_info:
-            summary.append(f"- Gender: {static_info['gender']}")
+            gender_value = static_info['gender']
+            gender_text = "Male" if gender_value == 1 else "Female"
+            summary.append(f"- Gender: {gender_text} ({gender_value})")
         if "age" in static_info:
             summary.append(f"- Age: {static_info['age']:.1f} years")
         if "elixhauser" in static_info:
@@ -391,7 +406,7 @@ class PatientRetrievalTool:
         if missing_data:
             summary.append("\n## Missing Data Report")
             summary.extend(missing_data[:5])  # Show top 5 missing variables
-            
+                
         return "\n".join(summary)
 
     def get_patient_time_series(self, patient_id: int, variables: List[str]) -> Dict[str, Any]:
