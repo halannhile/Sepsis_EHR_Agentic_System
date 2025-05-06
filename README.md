@@ -18,6 +18,18 @@ This project implements an intelligent agent system that assists healthcare prof
 
 The system uses machine learning models to predict mortality and explainable AI techniques (SHAP) to generate interpretations of these predictions.
 
+## Demo
+
+<img width="1502" alt="image" src="https://github.com/user-attachments/assets/cdcd5329-6830-4ead-8b2d-42ea8e311885" />
+<img width="1111" alt="image" src="https://github.com/user-attachments/assets/c0ac1a3f-24cb-483e-940b-0a7b8ab66708" />
+<img width="1495" alt="image" src="https://github.com/user-attachments/assets/edd2eaaa-7bd8-4cd0-8fc6-e91b9bfd0cc2" />
+<img width="1505" alt="image" src="https://github.com/user-attachments/assets/8b911efa-1b2f-4014-a444-7e19767c6d84" />
+<img width="1485" alt="image" src="https://github.com/user-attachments/assets/a6e9aa4d-d8f2-43a6-8d8c-34f745011e1f" />
+<img width="1491" alt="image" src="https://github.com/user-attachments/assets/45461a82-ed1b-4e09-8048-de9fcb7c7510" />
+<img width="1495" alt="image" src="https://github.com/user-attachments/assets/d3e34ab4-566b-42ed-87c9-80c5561c1c39" />
+<img width="1495" alt="image" src="https://github.com/user-attachments/assets/864e2452-482a-4287-bd2d-5aceda57e569" />
+
+
 ## Architecture
 
 The system consists of several integrated components:
@@ -137,3 +149,5 @@ The mortality prediction uses a machine learning model trained on sepsis EHR dat
 - Detects and imputes missing values
 - Generates probability estimates for 90-day mortality
 - Provides confidence levels for predictions
+
+
